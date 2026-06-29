@@ -117,15 +117,6 @@ final class SMC {
         return true
     }
 
-    // Battery temperature in °C. SMC temp keys are SP78 (big-endian fixed point):
-    // high byte = integer degrees, low byte = /256 fraction we don't need. Pick the
-    // first key that exists (varies by board) once; nil if none → temp guard disabled.
-    lazy var tempKey: String? = ["TB0T", "TB1T", "TB2T"].first { probe($0).exists }
-    func tempC() -> Int? {
-        guard let key = tempKey, let raw = readRaw(key) else { return nil }
-        return decodeTemp(raw)
-    }
-
     // diagnostic: does this key exist, what size, and its first byte
     func probe(_ keyStr: String) -> (exists: Bool, size: UInt32, first: UInt8?) {
         let key = fourCC(keyStr)
@@ -247,18 +238,14 @@ func decideBand(pct: Int, band: (high: Int, low: Int), drain: Bool) -> Action {
     if pct <= band.low { return .charge }              // bottom of band: recharge
     return .hold                                       // inside band: hold
 }
-// Decode an SMC temperature payload to whole °C. Apple Silicon = 4-byte "flt"
-// (little-endian Float32); Intel = 2-byte SP78 (high byte = integer °C). Returns nil
-// for an implausible reading so a garbled key can never wedge charging off permanently.
-func decodeTemp(_ raw: [UInt8]) -> Int? {
-    let c: Int
-    if raw.count == 4 {
-        let bits = UInt32(raw[0]) | UInt32(raw[1]) << 8 | UInt32(raw[2]) << 16 | UInt32(raw[3]) << 24
-        c = Int(Float(bitPattern: bits))
-    } else if raw.count >= 2 {
-        c = Int(raw[0])
-    } else { return nil }
-    return (0...80).contains(c) ? c : nil
+// Battery cell temperature in whole °C, from the battery's own sensor via IORegistry
+// ("Temperature" is centi-°C). Authoritative — this is what Coconut/Apple report, ~3°C
+// cooler than the SMC board sensors. nil if unreadable → heat guard disables itself.
+func batteryTempC() -> Int? {
+    let out = shell("/usr/sbin/ioreg", ["-rn", "AppleSmartBattery"])
+    guard let r = out.range(of: #""Temperature" = (\d+)"#, options: .regularExpression),
+          let centi = Int(out[r].drop(while: { !$0.isNumber })) else { return nil }
+    return centi / 100
 }
 
 // Heat guard: never charge while the battery is hot. Only blocks charging — holding and
@@ -278,7 +265,7 @@ if arg == "status" {
     let band = readBand()
     let kind = readMode() == "drain" ? "drain" : "hold"
     let k = smc.k
-    let temp = smc.tempC().map { "\($0)°C" } ?? "?"
+    let temp = batteryTempC().map { "\($0)°C" } ?? "?"
     print("battery=\(pct)% band=\(band.low)-\(band.high) mode=\(kind) temp=\(temp)/\(readTempLimit())°C charging=\(isCharging()) gate=\(k.gate.joined(separator: ",")) adapter=\(k.adapter)")
     exit(0)
 }
@@ -321,10 +308,6 @@ if arg == "selftest" {   // band math — no hardware needed
     assert(tempGuard(.charge, hot: true) == .hold, "hot blocks charging")
     assert(tempGuard(.charge, hot: false) == .charge, "cool allows charging")
     assert(tempGuard(.drainOff, hot: true) == .drainOff, "hot still drains (helps cool)")
-    assert(decodeTemp([30, 128]) == 30, "SP78: high byte is integer °C")
-    assert(decodeTemp([0, 0, 0xF0, 0x41]) == 30, "flt: little-endian Float32 30.0")
-    assert(decodeTemp([0, 0, 0, 0]) == 0, "flt: 0.0 -> 0")
-    assert(decodeTemp([0, 0, 0x48, 0x43]) == nil, "flt 200.0 out of range -> nil (fail safe)")
     print("selftest OK"); exit(0)
 }
 
@@ -365,7 +348,7 @@ var lastState = ""   // debounce: only notify when the state label changes
 var wasHot = false
 while true {
     let band = readBand(), drain = readMode() == "drain"
-    let temp = smc.tempC()
+    let temp = batteryTempC()
     let hot = (temp ?? 0) >= readTempLimit()
     if hot && !wasHot { notify("too hot (\(temp ?? 0)°C) — charging paused") }
     wasHot = hot
