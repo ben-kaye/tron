@@ -192,18 +192,25 @@ func log(_ msg: String) {
     FileHandle.standardError.write("\(t) \(msg)\n".data(using: .utf8)!)
 }
 
-// /etc/tron-limit is a single "TARGET": ±2% hysteresis band [TARGET-2, TARGET+2].
-// Charge to TARGET+2, hold, recharge once below TARGET-2. Edit file, no restart.
-// Returns (high, low): stop charging at >= high, resume charging at <= low.
+// /etc/tron-limit holds 1–3 numbers "TARGET [UP] [DOWN]":
+//   "TARGET"          → ±2% window: stop at TARGET+2, recharge at TARGET-2
+//   "TARGET UP"       → ±UP window (lower mirrors upper): [TARGET-UP, TARGET+UP]
+//   "TARGET UP DOWN"  → asymmetric: stop at TARGET+UP, recharge at TARGET-DOWN (e.g. 80 1 2 → 79..81)
+// Offsets are magnitudes (sign ignored). Fractional values round to whole percent.
+// Returns (high, low): stop charging at >= high, resume charging at <= low. Edit file, no restart.
 func bandFrom(_ nums: [Int]) -> (high: Int, low: Int) {
     let target = nums.first ?? 80
-    let high = max(21, min(100, target + 2))
-    let low = max(20, min(high - 1, target - 2))
+    let up   = nums.count >= 2 ? abs(nums[1]) : 2
+    let down = nums.count >= 3 ? abs(nums[2]) : up          // lower omitted → mirror upper
+    let high = max(21, min(100, target + up))
+    let low  = max(20, min(high - 1, target - down))
     return (high, low)
 }
 func readBand() -> (high: Int, low: Int) {
     let s = (try? String(contentsOfFile: "/etc/tron-limit", encoding: .utf8)) ?? ""
-    return bandFrom(s.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: " ").compactMap { Int($0) })
+    // split on any whitespace; accept ints or floats, rounding to whole percent
+    let nums = s.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" }).compactMap { Double($0).map { Int($0.rounded()) } }
+    return bandFrom(nums)
 }
 
 // `restart` must run BEFORE opening the SMC: its whole job is to clear a wedged AppleSMC
@@ -315,6 +322,10 @@ if arg == "selftest" {   // band math — no hardware needed
     assert(bandFrom([]) == (82, 78), "empty -> default 80±2")
     assert(bandFrom([100]) == (100, 98), "high clamps to 100")
     assert(bandFrom([50]).low < bandFrom([50]).high, "low always below high")
+    assert(bandFrom([80, 1]) == (81, 79), "up 1, lower mirrors -> [79, 81]")
+    assert(bandFrom([80, 1, 2]) == (81, 78), "asymmetric up 1 down 2 -> [78, 81]")
+    assert(bandFrom([80, 0, 0]) == (80, 79), "zero offsets -> low forced just below high")
+    assert(bandFrom([90, 80, 80]) == (100, 20), "high clamps to 100, low clamps to 20")
     assert(decideBand(pct: 90, band: (82, 78), drain: false) == .hold, "above cap, no drain -> hold")
     assert(decideBand(pct: 90, band: (82, 78), drain: true) == .drainOff, "above cap + drain -> discharge")
     assert(decideBand(pct: 70, band: (82, 78), drain: false) == .charge, "below floor -> charge")

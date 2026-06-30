@@ -26,7 +26,7 @@ sudo launchctl bootout system "$PLIST" 2>/dev/null || true
 sudo launchctl bootstrap system "$PLIST"
 echo "tron installed. limit=$(cat "$LIMIT_FILE")%"
 echo "  change limit:   echo 75 | sudo tee $LIMIT_FILE"
-echo "  sailing mode:   echo '80 60' | sudo tee $LIMIT_FILE   # drain to 60 before recharging to 80"
+echo "  explicit window: echo '80 60' | sudo tee $LIMIT_FILE  # stop at 80, recharge at 60 (upper lower)"
 echo "  drain mode:     echo drain | sudo tee /etc/tron-mode  # actively discharge to limit (back: echo hold)"
 echo "  heat ceiling:   echo 35 | sudo tee /etc/tron-temp    # pause charging above this battery °C (default 35)"
 echo "  top up full:    sudo $BIN full         # charge to 100% once, then revert to band"
