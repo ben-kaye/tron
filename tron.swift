@@ -42,7 +42,21 @@ final class SMC {
         UInt32(buf[off])|(UInt32(buf[off+1]) << 8)|(UInt32(buf[off+2]) << 16)|(UInt32(buf[off+3]) << 24)
     }
 
+    // Build the 80-byte request. selector: 5 read, 6 write, 9 keyinfo.
+    // Reads set size only; writes set size + type; keyinfo sets neither (0 == skip).
+    private func request(key: UInt32, selector: UInt8, size: UInt32 = 0, type: UInt32 = 0) -> [UInt8] {
+        var buf = [UInt8](repeating: 0, count: 80)
+        setU32(&buf, OFF_KEY, key)
+        if size != 0 { setU32(&buf, OFF_DATASIZE, size) }
+        if type != 0 { setU32(&buf, OFF_DATATYPE, type) }
+        buf[OFF_DATA8] = selector
+        return buf
+    }
+
     var debug = false
+    // A wedged AppleSMC (e.g. a stale daemon holding the connection) can block this call indefinitely.
+    // We don't try to bound it here — a half-cancelled SMC call on a shared connection is worse than a
+    // hang. Clear a wedge with `tron restart`, which restarts the daemon and frees the connection.
     private func call(_ input: inout [UInt8]) -> [UInt8]? {
         var output = [UInt8](repeating: 0, count: 80)
         var outSize = 80
@@ -61,9 +75,7 @@ final class SMC {
 
     // returns (dataSize, dataType)
     private func keyInfo(_ key: UInt32) -> (UInt32, UInt32)? {
-        var buf = [UInt8](repeating: 0, count: 80)
-        setU32(&buf, OFF_KEY, key)
-        buf[OFF_DATA8] = 9
+        var buf = request(key: key, selector: 9)
         guard let out = call(&buf), out[OFF_RESULT] == 0 else { return nil }
         return (getU32(out, OFF_DATASIZE), getU32(out, OFF_DATATYPE))
     }
@@ -71,11 +83,7 @@ final class SMC {
     func writeByte(_ keyStr: String, _ value: UInt8) -> Bool {
         let key = fourCC(keyStr)
         guard let (size, type) = keyInfo(key), size >= 1 else { return false }
-        var buf = [UInt8](repeating: 0, count: 80)
-        setU32(&buf, OFF_KEY, key)
-        setU32(&buf, OFF_DATASIZE, size)
-        setU32(&buf, OFF_DATATYPE, type)
-        buf[OFF_DATA8] = 6
+        var buf = request(key: key, selector: 6, size: size, type: type)
         // SMC numeric payloads are big-endian: low byte goes last within the key's size.
         buf[OFF_BYTES + Int(size) - 1] = value
         guard let out = call(&buf), out[OFF_RESULT] == 0 else { return false }
@@ -85,10 +93,7 @@ final class SMC {
     func readByte(_ keyStr: String) -> UInt8? {
         let key = fourCC(keyStr)
         guard let (size, _) = keyInfo(key), size >= 1 else { return nil }
-        var buf = [UInt8](repeating: 0, count: 80)
-        setU32(&buf, OFF_KEY, key)
-        setU32(&buf, OFF_DATASIZE, size)
-        buf[OFF_DATA8] = 5
+        var buf = request(key: key, selector: 5, size: size)
         guard let out = call(&buf), out[OFF_RESULT] == 0 else { return nil }
         return out[OFF_BYTES]
     }
@@ -97,21 +102,14 @@ final class SMC {
     func readRaw(_ keyStr: String) -> [UInt8]? {
         let key = fourCC(keyStr)
         guard let (size, _) = keyInfo(key), size >= 1 else { return nil }
-        var buf = [UInt8](repeating: 0, count: 80)
-        setU32(&buf, OFF_KEY, key)
-        setU32(&buf, OFF_DATASIZE, size)
-        buf[OFF_DATA8] = 5
+        var buf = request(key: key, selector: 5, size: size)
         guard let out = call(&buf), out[OFF_RESULT] == 0 else { return nil }
         return Array(out[OFF_BYTES ..< OFF_BYTES + Int(size)])
     }
     func writeRaw(_ keyStr: String, _ bytes: [UInt8]) -> Bool {
         let key = fourCC(keyStr)
         guard let (size, type) = keyInfo(key), Int(size) == bytes.count else { return false }
-        var buf = [UInt8](repeating: 0, count: 80)
-        setU32(&buf, OFF_KEY, key)
-        setU32(&buf, OFF_DATASIZE, size)
-        setU32(&buf, OFF_DATATYPE, type)
-        buf[OFF_DATA8] = 6
+        var buf = request(key: key, selector: 6, size: size, type: type)
         for (i, b) in bytes.enumerated() { buf[OFF_BYTES + i] = b }
         guard let out = call(&buf), out[OFF_RESULT] == 0 else { return false }
         return true
@@ -138,13 +136,17 @@ final class SMC {
     }
     lazy var k: Keys = keys()   // chip doesn't change at runtime — probe once
 
-    // Stop/allow charging WITHOUT draining (adapter stays on).
-    func setCharging(_ on: Bool) {
-        for g in k.gate { _ = writeRaw(g, on ? k.allow : k.stop) }
+    // Stop/allow charging WITHOUT draining (adapter stays on). false if any SMC write failed.
+    @discardableResult
+    func setCharging(_ on: Bool) -> Bool {
+        var ok = true
+        for g in k.gate { ok = writeRaw(g, on ? k.allow : k.stop) && ok }
+        return ok
     }
-    // Adapter on = normal; off = Mac runs off battery (force discharge).
-    func setAdapter(_ on: Bool) {
-        _ = writeByte(k.adapter, on ? 0 : 1)
+    // Adapter on = normal; off = Mac runs off battery (force discharge). false on SMC write failure.
+    @discardableResult
+    func setAdapter(_ on: Bool) -> Bool {
+        writeByte(k.adapter, on ? 0 : 1)
     }
     // Safe resting state: charging allowed + adapter on. Used on exit so nothing is ever stuck.
     func restore() { setAdapter(true); setCharging(true) }
@@ -173,6 +175,7 @@ func isCharging() -> Bool {
     let l = chargeLine().lowercased()
     return l.contains("; charging") && !l.contains("not charging")
 }
+func onAC() -> Bool { chargeLine().contains("AC Power") }
 
 // Notifications come from a root launchd daemon, so they must be posted as the
 // logged-in GUI user via `launchctl asuser <uid>` — root can't post banners directly.
@@ -181,6 +184,12 @@ func notify(_ msg: String) {
     guard !uid.isEmpty, uid != "0" else { return }   // no GUI user (login screen)
     _ = shell("/bin/launchctl", ["asuser", uid, "/usr/bin/osascript", "-e",
               "display notification \"\(msg)\" with title \"Tron\""])
+}
+
+// Timestamped line to stderr → launchd captures it to /var/log/tron.log (see install.sh).
+func log(_ msg: String) {
+    let t = ISO8601DateFormatter().string(from: Date())
+    FileHandle.standardError.write("\(t) \(msg)\n".data(using: .utf8)!)
 }
 
 // /etc/tron-limit is a single "TARGET": ±2% hysteresis band [TARGET-2, TARGET+2].
@@ -195,6 +204,14 @@ func bandFrom(_ nums: [Int]) -> (high: Int, low: Int) {
 func readBand() -> (high: Int, low: Int) {
     let s = (try? String(contentsOfFile: "/etc/tron-limit", encoding: .utf8)) ?? ""
     return bandFrom(s.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: " ").compactMap { Int($0) })
+}
+
+// `restart` must run BEFORE opening the SMC: its whole job is to clear a wedged AppleSMC
+// connection, so it can't afford to block on SMC() itself. Restarts the launchd daemon (root).
+if CommandLine.arguments.dropFirst().first == "restart" {
+    let out = shell("/bin/launchctl", ["kickstart", "-k", "system/com.tron"])
+    print("restarted com.tron daemon\(out.isEmpty ? "" : ": \(out)")")
+    exit(0)
 }
 
 guard let smc = SMC() else {
@@ -311,6 +328,17 @@ if arg == "selftest" {   // band math — no hardware needed
     print("selftest OK"); exit(0)
 }
 
+// macOS Sonoma+ has its own Settings → Battery → Charge Limit that writes the same SMC
+// keys; when it's on, our writes get overridden and the gate won't open. Detect it
+// behaviorally: open the gate on AC below 100%, and if pmset still won't charge, Apple wins.
+if arg == "check" {
+    guard onAC() else { print("plug in AC first"); exit(2) }
+    if (batteryPercent() ?? 0) >= 100 { print("battery full — drain below 100% and retry"); exit(2) }
+    smc.restore(); Thread.sleep(forTimeInterval: 5)
+    if isCharging() { print("✅ tron controls charging — macOS native limit is off"); exit(0) }
+    print("❌ gate opened but not charging — turn OFF System Settings → Battery → Charge Limit"); exit(1)
+}
+
 if arg == "on"    { smc.restore(); print("charging enabled, adapter on"); exit(0) }
 if arg == "drain" { smc.setAdapter(false); print("force-discharging (adapter off)"); exit(0) }
 
@@ -334,18 +362,37 @@ signal(SIGTERM, onExit)
 signal(SIGINT, onExit)
 
 func apply(_ a: Action) {
+    // Run BOTH writes unconditionally then combine — never let a failed adapter write
+    // short-circuit away the safety-critical charge-gate write (would overcharge on .hold).
+    let ok: Bool
     switch a {
-    case .charge:   smc.setAdapter(true); smc.setCharging(true)
-    case .hold:     smc.setAdapter(true); smc.setCharging(false)
-    case .drainOff: smc.setAdapter(false)
+    case .charge:   let p = smc.setAdapter(true);  let g = smc.setCharging(true);  ok = p && g
+    case .hold:     let p = smc.setAdapter(true);  let g = smc.setCharging(false); ok = p && g
+    case .drainOff: ok = smc.setAdapter(false)
     case .reached:
         try? FileManager.default.removeItem(atPath: "/etc/tron-once")
-        smc.setAdapter(true); smc.setCharging(false)
+        let p = smc.setAdapter(true); let g = smc.setCharging(false); ok = p && g
     }
+    if !ok { log("SMC write FAILED applying \(a)") }
 }
 
-var lastState = ""   // debounce: only notify when the state label changes
+var notifiedCap = false   // true while holding at cap, so we notify only on entry (reset by a charge cycle)
 var wasHot = false
+var warnedNative = false   // warn once if macOS native charge limit is overriding us
+
+// Log every action change, plus a heartbeat every ~5min so /var/log/tron.log proves the daemon is alive.
+var lastAction: Action? = nil
+var tick = 0
+func record(_ a: Action, pct: Int, temp: Int?, charging: Bool, ac: Bool) {
+    tick += 1
+    if a != lastAction {
+        log("\(pct)% \(ac ? "AC" : "batt") \(temp.map { "\($0)°C " } ?? "")charging=\(charging) -> \(a)")
+        lastAction = a
+    } else if tick % 15 == 0 {
+        log("heartbeat \(pct)% \(a) charging=\(charging)")
+    }
+}
+log("daemon start — band=\(readBand()) mode=\(readMode()) gate=\(smc.k.gate.joined(separator: ","))")
 while true {
     let band = readBand(), drain = readMode() == "drain"
     let temp = batteryTempC()
@@ -353,17 +400,28 @@ while true {
     if hot && !wasHot { notify("too hot (\(temp ?? 0)°C) — charging paused") }
     wasHot = hot
     if let pct = batteryPercent() {
+        let charging = isCharging(), ac = onAC()   // one pmset pair, shared by both branches below
         if let target = readOnce() {            // one-shot go-to-target overrides the band
             let a = tempGuard(decideOnce(pct: pct, target: target), hot: hot)
             apply(a)
+            record(a, pct: pct, temp: temp, charging: charging, ac: ac)
             if a == .reached { notify("reached \(pct)%") }
             Thread.sleep(forTimeInterval: 20); continue
         }
         let a = tempGuard(decideBand(pct: pct, band: band, drain: drain), hot: hot)
         apply(a)
+        record(a, pct: pct, temp: temp, charging: charging, ac: ac)
+        // we commanded charge on AC below the floor but it didn't take → Apple's native limit owns the gate
+        if a == .charge && ac && !charging && !hot {
+            if !warnedNative {
+                notify("not charging — disable System Settings → Battery → Charge Limit")
+                log("commanded charge on AC but pmset shows not-charging — macOS native Charge Limit overriding?")
+                warnedNative = true
+            }
+        } else { warnedNative = false }
         let atCap = a == .hold && pct >= band.high          // top-of-band hold (not inside-band)
-        if atCap && lastState != "hold" { notify("holding at \(pct)% (cap \(band.high)%)") }
-        if atCap { lastState = "hold" } else if a == .charge { lastState = "charge" }
+        if atCap && !notifiedCap { notify("holding at \(pct)% (cap \(band.high)%)") }
+        if atCap { notifiedCap = true } else if a == .charge { notifiedCap = false }
     }
     Thread.sleep(forTimeInterval: 20)
 }

@@ -32,4 +32,5 @@ echo "  heat ceiling:   echo 35 | sudo tee /etc/tron-temp    # pause charging ab
 echo "  top up full:    sudo $BIN full         # charge to 100% once, then revert to band"
 echo "  drain to level: sudo $BIN drain-to 50  # discharge to 50% once, then revert to band"
 echo "  status:         sudo $BIN status"
+echo "  restart:        sudo $BIN restart      # clear a wedged SMC by restarting the daemon"
 echo "  uninstall:      ./uninstall.sh"
