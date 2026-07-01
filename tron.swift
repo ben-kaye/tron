@@ -159,8 +159,10 @@ func shell(_ exe: String, _ args: [String]) -> String {
     p.arguments = args
     let pipe = Pipe(); p.standardOutput = pipe
     guard (try? p.run()) != nil else { return "" }
-    p.waitUntilExit()
+    // Read before wait: ioreg's output overflows the 64KB pipe buffer, and a full
+    // buffer blocks the child while waitUntilExit() blocks us → deadlock.
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
     return String(data: data, encoding: .utf8) ?? ""
 }
 
