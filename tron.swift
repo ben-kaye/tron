@@ -166,18 +166,18 @@ func shell(_ exe: String, _ args: [String]) -> String {
     return String(data: data, encoding: .utf8) ?? ""
 }
 
-// raw pmset battery line, plus whether it currently reports actively charging.
+// raw pmset battery line → percent + AC. One pmset spawn feeds both per tick (default = fetch own).
 func chargeLine() -> String { shell("/usr/bin/pmset", ["-g", "batt"]) }
-func batteryPercent() -> Int? {
-    let l = chargeLine()
+func batteryPercent(_ l: String = chargeLine()) -> Int? {
     guard let r = l.range(of: #"(\d+)%"#, options: .regularExpression) else { return nil }
     return Int(l[r].dropLast())
 }
-func isCharging() -> Bool {
-    let l = chargeLine().lowercased()
-    return l.contains("; charging") && !l.contains("not charging")
-}
-func onAC() -> Bool { chargeLine().contains("AC Power") }
+func onAC(_ l: String = chargeLine()) -> Bool { l.contains("AC Power") }
+
+// Actual charging state comes from IORegistry, NOT pmset: pmset's text lags and prints
+// "AC attached; not charging" while the cell is really taking several amps (IsCharging=Yes).
+// Trusting pmset made the daemon fire a bogus "disable native Charge Limit" warning mid-charge.
+func isCharging(_ io: String = batteryIO()) -> Bool { io.range(of: #""IsCharging" = Yes"#) != nil }
 
 // Notifications come from a root launchd daemon, so they must be posted as the
 // logged-in GUI user via `launchctl asuser <uid>` — root can't post banners directly.
@@ -267,10 +267,10 @@ func decideBand(pct: Int, band: (high: Int, low: Int), drain: Bool) -> Action {
 // Battery cell temperature in whole °C, from the battery's own sensor via IORegistry
 // ("Temperature" is centi-°C). Authoritative — this is what Coconut/Apple report, ~3°C
 // cooler than the SMC board sensors. nil if unreadable → heat guard disables itself.
-func batteryTempC() -> Int? {
-    let out = shell("/usr/sbin/ioreg", ["-rn", "AppleSmartBattery"])
-    guard let r = out.range(of: #""Temperature" = (\d+)"#, options: .regularExpression),
-          let centi = Int(out[r].drop(while: { !$0.isNumber })) else { return nil }
+func batteryIO() -> String { shell("/usr/sbin/ioreg", ["-rn", "AppleSmartBattery"]) }
+func batteryTempC(_ io: String = batteryIO()) -> Int? {
+    guard let r = io.range(of: #""Temperature" = (\d+)"#, options: .regularExpression),
+          let centi = Int(io[r].drop(while: { !$0.isNumber })) else { return nil }
     return centi / 100
 }
 
@@ -287,12 +287,30 @@ func readTempLimit() -> Int {
 let arg = CommandLine.arguments.dropFirst().first
 
 if arg == "status" {
-    let pct = batteryPercent().map(String.init) ?? "?"
+    let pctN = batteryPercent()
+    let pct = pctN.map(String.init) ?? "?"
     let band = readBand()
-    let kind = readMode() == "drain" ? "drain" : "hold"
+    let drain = readMode() == "drain"
     let k = smc.k
-    let temp = batteryTempC().map { "\($0)°C" } ?? "?"
-    print("battery=\(pct)% band=\(band.low)-\(band.high) mode=\(kind) temp=\(temp)/\(readTempLimit())°C charging=\(isCharging()) gate=\(k.gate.joined(separator: ",")) adapter=\(k.adapter)")
+    let io = batteryIO()
+    let temp = batteryTempC(io)
+    let hot = (temp ?? 0) >= readTempLimit()
+    let tempS = temp.map { "\($0)°C" } ?? "?"
+    let line = chargeLine(), ac = onAC(line)
+    // what the daemon would do right now — the same decision the loop makes.
+    // off AC the hardware can't charge no matter what the policy wants, so say so.
+    let now: String = pctN.map { p in
+        if !ac { return "on battery (unplugged)" }
+        switch tempGuard(readOnce().map { decideOnce(pct: p, target: $0) } ?? decideBand(pct: p, band: band, drain: drain), hot: hot) {
+        case .charge:   return "charging up"
+        case .hold:     return p >= band.high ? "holding at cap" : "idle (in band)"
+        case .drainOff: return "draining (off adapter)"
+        case .reached:  return "at one-shot target"
+        }
+    } ?? "?"
+    print("battery=\(pct)% → \(now)")
+    print("policy: charge ≤\(band.low)%, stop at \(band.low + 1)%, cap \(band.high)% (mode=\(drain ? "drain" : "hold"))")
+    print("temp=\(tempS)/\(readTempLimit())°C\(hot ? " HOT" : "")  ac=\(ac) charging=\(isCharging(io))  gate=\(k.gate.joined(separator: ",")) adapter=\(k.adapter)")
     exit(0)
 }
 
@@ -370,9 +388,29 @@ if arg == "drain-to" {
 }
 
 // daemon. On any exit, restore the safe state so the battery is never left charging or draining.
-let onExit: @convention(c) (Int32) -> Void = { _ in SMC()?.restore(); exit(0) }
+// Restore on exit via a fresh connection (a C closure can't capture the live `smc`, and a fresh
+// one avoids reentering the main loop's in-flight SMC call). Retry the open so a transient
+// failure can't leave the battery stuck draining with the daemon gone.
+let onExit: @convention(c) (Int32) -> Void = { _ in
+    for _ in 0..<5 { if let s = SMC() { s.restore(); break } }
+    exit(0)
+}
 signal(SIGTERM, onExit)
 signal(SIGINT, onExit)
+
+// Watchdog: a tick that wedges in an SMC ioctl or a pmset/ioreg shell() must not strand the
+// adapter off, draining a plugged-in Mac forever (observed: loop dead 6h, battery -27%). Each
+// tick arms alarm(WATCHDOG); a hang trips SIGALRM → _exit, and launchd KeepAlive relaunches with
+// a fresh SMC connection that re-decides. We do NOT try to restore here — the SMC may be the thing
+// that's wedged, so a fresh process is the only reliable recovery (same idea as `tron restart`).
+// ponytail: process-level watchdog; per-call timeouts on SMC/shell if the ~40s blip matters.
+let WATCHDOG: UInt32 = 30   // normal tick is sub-second; sleep (20s) runs disarmed
+let onWedge: @convention(c) (Int32) -> Void = { _ in
+    let m: StaticString = "watchdog: tick timed out — exiting for launchd restart\n"
+    write(2, m.utf8Start, m.utf8CodeUnitCount)   // async-signal-safe: static bytes, raw write
+    _exit(1)
+}
+signal(SIGALRM, onWedge)
 
 func apply(_ a: Action) {
     // Run BOTH writes unconditionally then combine — never let a failed adapter write
@@ -407,19 +445,22 @@ func record(_ a: Action, pct: Int, temp: Int?, charging: Bool, ac: Bool) {
 }
 log("daemon start — band=\(readBand()) mode=\(readMode()) gate=\(smc.k.gate.joined(separator: ","))")
 while true {
+    alarm(WATCHDOG)   // arm before any hardware I/O; disarmed just before each sleep below
     let band = readBand(), drain = readMode() == "drain"
-    let temp = batteryTempC()
+    let io = batteryIO()                            // one ioreg spawn per tick → temp + charging
+    let temp = batteryTempC(io)
     let hot = (temp ?? 0) >= readTempLimit()
     if hot && !wasHot { notify("too hot (\(temp ?? 0)°C) — charging paused") }
     wasHot = hot
-    if let pct = batteryPercent() {
-        let charging = isCharging(), ac = onAC()   // one pmset pair, shared by both branches below
+    let line = chargeLine()                         // one pmset spawn per tick → percent + AC
+    if let pct = batteryPercent(line) {
+        let charging = isCharging(io), ac = onAC(line)     // shared by both branches below
         if let target = readOnce() {            // one-shot go-to-target overrides the band
             let a = tempGuard(decideOnce(pct: pct, target: target), hot: hot)
             apply(a)
             record(a, pct: pct, temp: temp, charging: charging, ac: ac)
             if a == .reached { notify("reached \(pct)%") }
-            Thread.sleep(forTimeInterval: 20); continue
+            alarm(0); Thread.sleep(forTimeInterval: 20); continue
         }
         let a = tempGuard(decideBand(pct: pct, band: band, drain: drain), hot: hot)
         apply(a)
@@ -436,5 +477,5 @@ while true {
         if atCap && !notifiedCap { notify("holding at \(pct)% (cap \(band.high)%)") }
         if atCap { notifiedCap = true } else if a == .charge { notifiedCap = false }
     }
-    Thread.sleep(forTimeInterval: 20)
+    alarm(0); Thread.sleep(forTimeInterval: 20)
 }
