@@ -95,7 +95,8 @@ final class SMC {
         guard let (size, _) = keyInfo(key), size >= 1 else { return nil }
         var buf = request(key: key, selector: 5, size: size)
         guard let out = call(&buf), out[OFF_RESULT] == 0 else { return nil }
-        return out[OFF_BYTES]
+        // Match writeByte: SMC numeric payloads are big-endian (low byte last).
+        return out[OFF_BYTES + Int(size) - 1]
     }
 
     // full payload read/write — used by findkey to snapshot and restore exactly.
@@ -115,7 +116,7 @@ final class SMC {
         return true
     }
 
-    // diagnostic: does this key exist, what size, and its first byte
+    // diagnostic: does this key exist, what size, and its scalar value byte (last payload byte)
     func probe(_ keyStr: String) -> (exists: Bool, size: UInt32, first: UInt8?) {
         let key = fourCC(keyStr)
         guard let (size, _) = keyInfo(key) else { return (false, 0, nil) }
@@ -149,20 +150,37 @@ final class SMC {
         writeByte(k.adapter, on ? 0 : 1)
     }
     // Safe resting state: charging allowed + adapter on. Used on exit so nothing is ever stuck.
-    func restore() { setAdapter(true); setCharging(true) }
+    // Both writes always run (no short-circuit). false if either failed.
+    @discardableResult
+    func restore() -> Bool {
+        let p = setAdapter(true); let g = setCharging(true)
+        return p && g
+    }
 }
 
-// run a command, capture stdout. Empty string on failure.
-func shell(_ exe: String, _ args: [String]) -> String {
+// Run a command, capture stdout. Empty string on failure or timeout.
+// Timeout is load-bearing: a hung pmset/ioreg used to freeze the whole daemon forever
+// (SIGALRM watchdog never ran — Swift is multi-threaded; SIGALRM often hits a blocked thread).
+func shell(_ exe: String, _ args: [String], timeout: TimeInterval = 8) -> String {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: exe)
     p.arguments = args
     let pipe = Pipe(); p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
     guard (try? p.run()) != nil else { return "" }
+    let pid = p.processIdentifier
+    // Kill the child if it outlives the budget so readData/wait can't block the tick.
+    let killer = DispatchWorkItem {
+        if p.isRunning {
+            kill(pid, SIGKILL)
+        }
+    }
+    DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer)
     // Read before wait: ioreg's output overflows the 64KB pipe buffer, and a full
     // buffer blocks the child while waitUntilExit() blocks us → deadlock.
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
+    killer.cancel()
     return String(data: data, encoding: .utf8) ?? ""
 }
 
@@ -181,11 +199,19 @@ func isCharging(_ io: String = batteryIO()) -> Bool { io.range(of: #""IsCharging
 
 // Notifications come from a root launchd daemon, so they must be posted as the
 // logged-in GUI user via `launchctl asuser <uid>` — root can't post banners directly.
+// Short timeout: a wedged osascript must not stall the charge loop.
 func notify(_ msg: String) {
-    let uid = shell("/usr/bin/stat", ["-f", "%u", "/dev/console"]).trimmingCharacters(in: .whitespacesAndNewlines)
+    let uid = shell("/usr/bin/stat", ["-f", "%u", "/dev/console"], timeout: 2)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
     guard !uid.isEmpty, uid != "0" else { return }   // no GUI user (login screen)
+    // Escape for AppleScript string literal (\, ", and newlines).
+    let esc = msg
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+        .replacingOccurrences(of: "\r", with: " ")
+        .replacingOccurrences(of: "\n", with: " ")
     _ = shell("/bin/launchctl", ["asuser", uid, "/usr/bin/osascript", "-e",
-              "display notification \"\(msg)\" with title \"Tron\""])
+              "display notification \"\(esc)\" with title \"Tron\""], timeout: 5)
 }
 
 // Timestamped line to stderr → launchd captures it to /var/log/tron.log (see install.sh).
@@ -309,7 +335,7 @@ if arg == "status" {
         }
     } ?? "?"
     print("battery=\(pct)% → \(now)")
-    print("policy: charge ≤\(band.low)%, stop at \(band.low + 1)%, cap \(band.high)% (mode=\(drain ? "drain" : "hold"))")
+    print("policy: charge ≤\(band.low)%, hold in band, cap ≥\(band.high)% (mode=\(drain ? "drain" : "hold"))")
     print("temp=\(tempS)/\(readTempLimit())°C\(hot ? " HOT" : "")  ac=\(ac) charging=\(isCharging(io))  gate=\(k.gate.joined(separator: ",")) adapter=\(k.adapter)")
     exit(0)
 }
@@ -338,24 +364,31 @@ if arg == "test" {
 }
 
 if arg == "selftest" {   // band math — no hardware needed
-    assert(bandFrom([80]) == (82, 78), "target 80 -> charge to 82, resume below 78")
-    assert(bandFrom([]) == (82, 78), "empty -> default 80±2")
-    assert(bandFrom([100]) == (100, 98), "high clamps to 100")
-    assert(bandFrom([50]).low < bandFrom([50]).high, "low always below high")
-    assert(bandFrom([80, 1]) == (81, 79), "up 1, lower mirrors -> [79, 81]")
-    assert(bandFrom([80, 1, 2]) == (81, 78), "asymmetric up 1 down 2 -> [78, 81]")
-    assert(bandFrom([80, 0, 0]) == (80, 79), "zero offsets -> low forced just below high")
-    assert(bandFrom([90, 80, 80]) == (100, 20), "high clamps to 100, low clamps to 20")
-    assert(decideBand(pct: 90, band: (82, 78), drain: false) == .hold, "above cap, no drain -> hold")
-    assert(decideBand(pct: 90, band: (82, 78), drain: true) == .drainOff, "above cap + drain -> discharge")
-    assert(decideBand(pct: 70, band: (82, 78), drain: false) == .charge, "below floor -> charge")
-    assert(decideBand(pct: 80, band: (82, 78), drain: false) == .hold, "inside band -> hold")
-    assert(decideOnce(pct: 50, target: 80) == .charge, "one-shot below target -> charge")
-    assert(decideOnce(pct: 90, target: 80) == .drainOff, "one-shot above target -> drain")
-    assert(decideOnce(pct: 80, target: 80) == .reached, "one-shot at target -> reached")
-    assert(tempGuard(.charge, hot: true) == .hold, "hot blocks charging")
-    assert(tempGuard(.charge, hot: false) == .charge, "cool allows charging")
-    assert(tempGuard(.drainOff, hot: true) == .drainOff, "hot still drains (helps cool)")
+    // Do not use assert: install builds with swiftc -O, which strips asserts.
+    func check(_ cond: Bool, _ msg: String) {
+        if !cond {
+            FileHandle.standardError.write("selftest FAIL: \(msg)\n".data(using: .utf8)!)
+            exit(1)
+        }
+    }
+    check(bandFrom([80]) == (82, 78), "target 80 -> charge to 82, resume below 78")
+    check(bandFrom([]) == (82, 78), "empty -> default 80±2")
+    check(bandFrom([100]) == (100, 98), "high clamps to 100")
+    check(bandFrom([50]).low < bandFrom([50]).high, "low always below high")
+    check(bandFrom([80, 1]) == (81, 79), "up 1, lower mirrors -> [79, 81]")
+    check(bandFrom([80, 1, 2]) == (81, 78), "asymmetric up 1 down 2 -> [78, 81]")
+    check(bandFrom([80, 0, 0]) == (80, 79), "zero offsets -> low forced just below high")
+    check(bandFrom([90, 80, 80]) == (100, 20), "high clamps to 100, low clamps to 20")
+    check(decideBand(pct: 90, band: (82, 78), drain: false) == .hold, "above cap, no drain -> hold")
+    check(decideBand(pct: 90, band: (82, 78), drain: true) == .drainOff, "above cap + drain -> discharge")
+    check(decideBand(pct: 70, band: (82, 78), drain: false) == .charge, "below floor -> charge")
+    check(decideBand(pct: 80, band: (82, 78), drain: false) == .hold, "inside band -> hold")
+    check(decideOnce(pct: 50, target: 80) == .charge, "one-shot below target -> charge")
+    check(decideOnce(pct: 90, target: 80) == .drainOff, "one-shot above target -> drain")
+    check(decideOnce(pct: 80, target: 80) == .reached, "one-shot at target -> reached")
+    check(tempGuard(.charge, hot: true) == .hold, "hot blocks charging")
+    check(tempGuard(.charge, hot: false) == .charge, "cool allows charging")
+    check(tempGuard(.drainOff, hot: true) == .drainOff, "hot still drains (helps cool)")
     print("selftest OK"); exit(0)
 }
 
@@ -365,18 +398,43 @@ if arg == "selftest" {   // band math — no hardware needed
 if arg == "check" {
     guard onAC() else { print("plug in AC first"); exit(2) }
     if (batteryPercent() ?? 0) >= 100 { print("battery full — drain below 100% and retry"); exit(2) }
-    smc.restore(); Thread.sleep(forTimeInterval: 5)
+    guard smc.restore() else {
+        FileHandle.standardError.write("SMC restore failed\n".data(using: .utf8)!)
+        exit(1)
+    }
+    Thread.sleep(forTimeInterval: 5)
     if isCharging() { print("✅ tron controls charging — macOS native limit is off"); exit(0) }
     print("❌ gate opened but not charging — turn OFF System Settings → Battery → Charge Limit"); exit(1)
 }
 
-if arg == "on"    { smc.restore(); print("charging enabled, adapter on"); exit(0) }
-if arg == "drain" { smc.setAdapter(false); print("force-discharging (adapter off)"); exit(0) }
+if arg == "on" {
+    // Daemon re-asserts policy every ~20s — this is a temporary unlock (e.g. uninstall).
+    guard smc.restore() else {
+        FileHandle.standardError.write("SMC restore failed\n".data(using: .utf8)!)
+        exit(1)
+    }
+    print("charging enabled, adapter on (daemon will reapply policy within ~20s if running)")
+    exit(0)
+}
+if arg == "drain" {
+    let p = smc.setAdapter(false); let g = smc.setCharging(false)
+    guard p && g else {
+        FileHandle.standardError.write("SMC write failed\n".data(using: .utf8)!)
+        exit(1)
+    }
+    print("force-discharging (adapter off; daemon will reapply policy within ~20s if running)")
+    exit(0)
+}
 
 // one-shot go-to-target: write /etc/tron-once, daemon drives there then reverts to band.
 func setOnce(_ pct: Int) {
     let t = max(21, min(100, pct))
-    try? "\(t)".write(toFile: "/etc/tron-once", atomically: true, encoding: .utf8)
+    do {
+        try "\(t)".write(toFile: "/etc/tron-once", atomically: true, encoding: .utf8)
+    } catch {
+        FileHandle.standardError.write("failed to write /etc/tron-once: \(error)\n".data(using: .utf8)!)
+        exit(1)
+    }
     print("going to \(t)%, then reverting to band")
 }
 if arg == "full"     { setOnce(100); exit(0) }
@@ -387,39 +445,101 @@ if arg == "drain-to" {
     setOnce(t); exit(0)
 }
 
-// daemon. On any exit, restore the safe state so the battery is never left charging or draining.
-// Restore on exit via a fresh connection (a C closure can't capture the live `smc`, and a fresh
-// one avoids reentering the main loop's in-flight SMC call). Retry the open so a transient
-// failure can't leave the battery stuck draining with the daemon gone.
-let onExit: @convention(c) (Int32) -> Void = { _ in
-    for _ in 0..<5 { if let s = SMC() { s.restore(); break } }
-    exit(0)
+// daemon. SIGTERM/SIGINT use a self-pipe (write is async-signal-safe). Restore runs on the
+// main path so we never open SMC / call IOKit from a signal handler (deadlock risk if the
+// main thread is already inside IOConnectCallStructMethod).
+// Write fd must be a file-scope global — @convention(c) signal handlers cannot capture.
+private var gStopReadFd: Int32 = -1
+private var gStopWriteFd: Int32 = -1
+do {
+    var fds: [Int32] = [0, 0]
+    guard pipe(&fds) == 0 else {
+        FileHandle.standardError.write("pipe() failed for stop signal\n".data(using: .utf8)!)
+        exit(1)
+    }
+    gStopReadFd = fds[0]
+    gStopWriteFd = fds[1]
+    _ = fcntl(gStopReadFd, F_SETFL, O_NONBLOCK)   // poll without blocking the tick
 }
-signal(SIGTERM, onExit)
-signal(SIGINT, onExit)
 
-// Watchdog: a tick that wedges in an SMC ioctl or a pmset/ioreg shell() must not strand the
-// adapter off, draining a plugged-in Mac forever (observed: loop dead 6h, battery -27%). Each
-// tick arms alarm(WATCHDOG); a hang trips SIGALRM → _exit, and launchd KeepAlive relaunches with
-// a fresh SMC connection that re-decides. We do NOT try to restore here — the SMC may be the thing
-// that's wedged, so a fresh process is the only reliable recovery (same idea as `tron restart`).
-// ponytail: process-level watchdog; per-call timeouts on SMC/shell if the ~40s blip matters.
-let WATCHDOG: UInt32 = 30   // normal tick is sub-second; sleep (20s) runs disarmed
-let onWedge: @convention(c) (Int32) -> Void = { _ in
-    let m: StaticString = "watchdog: tick timed out — exiting for launchd restart\n"
-    write(2, m.utf8Start, m.utf8CodeUnitCount)   // async-signal-safe: static bytes, raw write
-    _exit(1)
+private func stopRequested() -> Bool {
+    var b: UInt8 = 0
+    return read(gStopReadFd, &b, 1) > 0
 }
-signal(SIGALRM, onWedge)
+
+let onSignal: @convention(c) (Int32) -> Void = { _ in
+    var b: UInt8 = 1
+    // write is async-signal-safe; extra bytes are fine (we only care that one arrives).
+    _ = write(gStopWriteFd, &b, 1)
+}
+signal(SIGTERM, onSignal)
+signal(SIGINT, onSignal)
+
+func restoreAndExit() -> Never {
+    // Prefer the live connection; fall back to a fresh open if writes fail.
+    for _ in 0..<5 {
+        if smc.restore() { exit(0) }
+        if let s = SMC(), s.restore() { exit(0) }
+        Thread.sleep(forTimeInterval: 0.2)
+    }
+    FileHandle.standardError.write("restore failed on exit — SMC may be wedged; try tron restart\n".data(using: .utf8)!)
+    exit(1)
+}
+
+// Sleep in 1s chunks so SIGTERM (self-pipe) is noticed within ~1s of the next poll.
+func sleepTick(_ seconds: TimeInterval = 20) {
+    let n = max(1, Int(seconds.rounded(.up)))
+    for _ in 0..<n {
+        if stopRequested() { return }
+        Thread.sleep(forTimeInterval: 1)
+    }
+}
+
+// Watchdog: a tick that wedges in an SMC ioctl must not strand the adapter off forever
+// (observed: loop dead days, battery free-charged to 99%). SIGALRM is unreliable here —
+// Swift/Foundation is multi-threaded and SIGALRM often lands on a thread that has it
+// blocked, so the old alarm() watchdog never fired (0 times in production logs).
+// A dedicated thread keeps running while the main thread is stuck in IOConnect, checks a
+// deadline, logs, and _exit(1); launchd KeepAlive relaunches with a fresh SMC connection.
+// Sleep (20s) runs disarmed. We do NOT restore on wedge — SMC may be the thing that's stuck.
+private let WATCHDOG_SEC: TimeInterval = 30   // normal tick is sub-second
+private let watchdogLock = NSLock()
+private var watchdogDeadline: TimeInterval? = nil   // nil = disarmed; else unix-time fire-at
+
+func armWatchdog(_ seconds: TimeInterval = WATCHDOG_SEC) {
+    watchdogLock.lock()
+    watchdogDeadline = Date().timeIntervalSince1970 + seconds
+    watchdogLock.unlock()
+}
+func disarmWatchdog() {
+    watchdogLock.lock()
+    watchdogDeadline = nil
+    watchdogLock.unlock()
+}
+
+// Side thread: never does SMC/shell work — only watches the deadline.
+Thread.detachNewThread {
+    while true {
+        Thread.sleep(forTimeInterval: 1)
+        watchdogLock.lock()
+        let due = watchdogDeadline
+        watchdogLock.unlock()
+        guard let due, Date().timeIntervalSince1970 >= due else { continue }
+        let m: StaticString = "watchdog: tick timed out — exiting for launchd restart\n"
+        write(2, m.utf8Start, m.utf8CodeUnitCount)
+        _exit(1)
+    }
+}
 
 func apply(_ a: Action) {
     // Run BOTH writes unconditionally then combine — never let a failed adapter write
     // short-circuit away the safety-critical charge-gate write (would overcharge on .hold).
+    // .drainOff also gates off so a failed adapter cut cannot leave the cell free-charging.
     let ok: Bool
     switch a {
     case .charge:   let p = smc.setAdapter(true);  let g = smc.setCharging(true);  ok = p && g
     case .hold:     let p = smc.setAdapter(true);  let g = smc.setCharging(false); ok = p && g
-    case .drainOff: ok = smc.setAdapter(false)
+    case .drainOff: let p = smc.setAdapter(false); let g = smc.setCharging(false); ok = p && g
     case .reached:
         try? FileManager.default.removeItem(atPath: "/etc/tron-once")
         let p = smc.setAdapter(true); let g = smc.setCharging(false); ok = p && g
@@ -430,6 +550,7 @@ func apply(_ a: Action) {
 var notifiedCap = false   // true while holding at cap, so we notify only on entry (reset by a charge cycle)
 var wasHot = false
 var warnedNative = false   // warn once if macOS native charge limit is overriding us
+var chargeMissTicks = 0    // consecutive ticks commanded charge but IsCharging still No
 
 // Log every action change, plus a heartbeat every ~5min so /var/log/tron.log proves the daemon is alive.
 var lastAction: Action? = nil
@@ -444,8 +565,13 @@ func record(_ a: Action, pct: Int, temp: Int?, charging: Bool, ac: Bool) {
     }
 }
 log("daemon start — band=\(readBand()) mode=\(readMode()) gate=\(smc.k.gate.joined(separator: ","))")
+// After a watchdog _exit during drain, launchd relaunches us; prefer wall power immediately
+// before the first full policy tick so we are not stranded on battery longer than one open.
+_ = smc.setAdapter(true)
+var missedPct = 0
 while true {
-    alarm(WATCHDOG)   // arm before any hardware I/O; disarmed just before each sleep below
+    if stopRequested() { disarmWatchdog(); restoreAndExit() }
+    armWatchdog()   // arm before any hardware I/O; disarmed just before each sleep below
     let band = readBand(), drain = readMode() == "drain"
     let io = batteryIO()                            // one ioreg spawn per tick → temp + charging
     let temp = batteryTempC(io)
@@ -454,28 +580,43 @@ while true {
     wasHot = hot
     let line = chargeLine()                         // one pmset spawn per tick → percent + AC
     if let pct = batteryPercent(line) {
+        missedPct = 0
         let charging = isCharging(io), ac = onAC(line)     // shared by both branches below
         if let target = readOnce() {            // one-shot go-to-target overrides the band
             let a = tempGuard(decideOnce(pct: pct, target: target), hot: hot)
             apply(a)
             record(a, pct: pct, temp: temp, charging: charging, ac: ac)
             if a == .reached { notify("reached \(pct)%") }
-            alarm(0); Thread.sleep(forTimeInterval: 20); continue
+            disarmWatchdog(); sleepTick(); continue
         }
         let a = tempGuard(decideBand(pct: pct, band: band, drain: drain), hot: hot)
         apply(a)
         record(a, pct: pct, temp: temp, charging: charging, ac: ac)
-        // we commanded charge on AC below the floor but it didn't take → Apple's native limit owns the gate
+        // Commanded charge on AC but still not charging after settle ticks → Apple's native limit.
+        // Require 2 consecutive ticks (~40s) so the first post-apply sample does not false-alarm
+        // (IsCharging is read before apply; hardware needs a moment to start taking amps).
         if a == .charge && ac && !charging && !hot {
-            if !warnedNative {
+            chargeMissTicks += 1
+            if chargeMissTicks >= 2 && !warnedNative {
                 notify("not charging — disable System Settings → Battery → Charge Limit")
-                log("commanded charge on AC but pmset shows not-charging — macOS native Charge Limit overriding?")
+                log("commanded charge on AC but IsCharging=No for \(chargeMissTicks) ticks — macOS native Charge Limit overriding?")
                 warnedNative = true
             }
-        } else { warnedNative = false }
+        } else {
+            chargeMissTicks = 0
+            warnedNative = false
+        }
         let atCap = a == .hold && pct >= band.high          // top-of-band hold (not inside-band)
         if atCap && !notifiedCap { notify("holding at \(pct)% (cap \(band.high)%)") }
         if atCap { notifiedCap = true } else if a == .charge { notifiedCap = false }
+    } else {
+        // pmset unreadable: fail safe to hold (adapter on, gate off) so we never stick in
+        // drain-off (empty battery) or free-charge (to 100%) without a valid reading.
+        missedPct += 1
+        apply(.hold)
+        if missedPct == 1 || missedPct % 15 == 0 {
+            log("pmset percent unreadable (x\(missedPct)) — holding (adapter on, gate off)")
+        }
     }
-    alarm(0); Thread.sleep(forTimeInterval: 20)
+    disarmWatchdog(); sleepTick()
 }
